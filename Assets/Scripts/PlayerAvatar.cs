@@ -1,3 +1,4 @@
+using System.Collections;
 using Unity.Netcode;
 using UnityEngine;
 using UnityEngine.InputSystem;
@@ -7,12 +8,12 @@ using UnityEngine.UI;
 // JUGADOR
 //
 // - WASD para moverse.
-// - El cofre se abre al TOCARLO (lo gestiona Chest).
-// - Los cubos se recogen al tocarlos (lo gestiona ColorCube):
-//   desaparecen y su color aparece en el inventario de la pantalla.
+// - El cofre se abre al TOCARLO (Chest).
+// - Los cubos se recogen al tocarlos (ColorCube) y van al inventario.
+// - E: saca el último cubo del inventario, el player lo agarra
+//   y lo tira hacia donde se movió por última vez.
 //
 // El inventario es una NetworkList que SOLO escribe el servidor.
-// La pantalla solo lee y dibuja.
 // =========================================================
 
 public class PlayerAvatar : NetworkBehaviour
@@ -20,15 +21,19 @@ public class PlayerAvatar : NetworkBehaviour
     public PlayerInputs2 inputs;
     public float Speed;
 
-    // Cantidad de casillas del inventario.
-    public int inventorySize = 5;
+    // Prefab del cubo (el mismo que usa el cofre: YY).
+    public NetworkObject cubePrefab;
 
-    // Guarda el índice de color (ColorCube.Colors) de cada cubo recogido.
+    public int inventorySize = 5;
+    public float throwForce = 6f;
+    public float holdTime = 0.3f; // tiempo que lo tiene en la mano antes de tirarlo
+
     public NetworkList<int> inventory = new NetworkList<int>();
 
     private Vector2 moveInput;
+    private Vector3 lastDirection = Vector3.forward;
+    private bool isThrowing;
 
-    // UI (solo existe en el dueño).
     private GameObject inventoryCanvas;
     private Image[] slotImages;
 
@@ -43,12 +48,14 @@ public class PlayerAvatar : NetworkBehaviour
         inputs.Enable();
         inputs.Player.Move.performed += OnMove;
         inputs.Player.Move.canceled += OnMoveCanceled;
+        inputs.Player.Interact.performed += OnInteract;
     }
 
     private void OnDisable()
     {
         inputs.Player.Move.performed -= OnMove;
         inputs.Player.Move.canceled -= OnMoveCanceled;
+        inputs.Player.Interact.performed -= OnInteract;
         inputs.Disable();
     }
 
@@ -62,12 +69,75 @@ public class PlayerAvatar : NetworkBehaviour
         moveInput = Vector2.zero;
     }
 
+    private void OnInteract(InputAction.CallbackContext ctx)
+    {
+        if (!IsOwner || !IsSpawned) return;
+
+        // El cliente solo PIDE tirar. El servidor decide.
+        ThrowFromInventoryRpc(lastDirection);
+    }
+
+
+    // =========================================================
+    // SACAR DEL INVENTARIO Y TIRAR (servidor)
+    // =========================================================
+
+    [Rpc(SendTo.Server, InvokePermission = RpcInvokePermission.Owner)]
+    private void ThrowFromInventoryRpc(Vector3 direction)
+    {
+        if (isThrowing) return;
+        if (inventory.Count == 0) return;
+        if (cubePrefab == null)
+        {
+            Debug.LogWarning("PlayerAvatar: falta asignar Cube Prefab.");
+            return;
+        }
+
+        int last = inventory.Count - 1;
+        int colorIdx = inventory[last];
+
+        // Sale del inventario (la casilla vuelve a ponerse blanca).
+        inventory.RemoveAt(last);
+
+        StartCoroutine(GrabAndThrow(colorIdx, direction));
+    }
+
+    private IEnumerator GrabAndThrow(int colorIdx, Vector3 direction)
+    {
+        isThrowing = true;
+
+        // 1. Aparece en la mano con su color.
+        ColorCube prefabCube = cubePrefab.GetComponent<ColorCube>();
+        Vector3 handPosition = transform.position + (prefabCube != null ? prefabCube.HandSlot : Vector3.zero);
+
+        NetworkObject cubeObject = Instantiate(cubePrefab, handPosition, Quaternion.identity);
+        ColorCube cube = cubeObject.GetComponent<ColorCube>();
+        cube.pendingColorIndex = colorIdx;
+
+        cubeObject.Spawn();
+
+        // 2. El player lo agarra.
+        cube.Grab(NetworkObject);
+
+        yield return new WaitForSeconds(holdTime);
+
+        // 3. Lo tira.
+        if (cubeObject != null && cubeObject.IsSpawned)
+        {
+            Vector3 flat = new Vector3(direction.x, 0f, direction.z);
+            if (flat.sqrMagnitude < 0.001f) flat = Vector3.forward;
+
+            cube.ThrowObj(flat.normalized * throwForce + Vector3.up * 2f);
+        }
+
+        isThrowing = false;
+    }
+
 
     // =========================================================
     // INVENTARIO
     // =========================================================
 
-    // Solo el servidor. Devuelve false si no hay espacio.
     public bool TryAddToInventory(int colorIndex)
     {
         if (!IsServer) return false;
@@ -84,8 +154,6 @@ public class PlayerAvatar : NetworkBehaviour
         BuildInventoryUI();
 
         inventory.OnListChanged += OnInventoryChanged;
-
-        // Si entras con cosas ya en el inventario, no se dispara el evento.
         RefreshInventoryUI();
     }
 
@@ -107,7 +175,6 @@ public class PlayerAvatar : NetworkBehaviour
 
         for (int i = 0; i < slotImages.Length; i++)
         {
-            // Casilla vacía = blanca. Con cubo = color del cubo.
             slotImages[i].color = i < inventory.Count
                 ? ColorCube.Colors[inventory[i] % ColorCube.Colors.Length]
                 : Color.white;
@@ -140,8 +207,6 @@ public class PlayerAvatar : NetworkBehaviour
 
             RectTransform rect = slot.GetComponent<RectTransform>();
             rect.SetParent(inventoryCanvas.transform, false);
-
-            // Columna arriba a la izquierda.
             rect.anchorMin = new Vector2(0f, 1f);
             rect.anchorMax = new Vector2(0f, 1f);
             rect.pivot = new Vector2(0.5f, 0.5f);
@@ -169,6 +234,8 @@ public class PlayerAvatar : NetworkBehaviour
         if (!IsOwner) return;
 
         Vector3 dir = new Vector3(moveInput.x, 0, moveInput.y);
+
+        if (dir.sqrMagnitude > 0.01f) lastDirection = dir;
 
         transform.position += dir * Speed * Time.deltaTime;
     }

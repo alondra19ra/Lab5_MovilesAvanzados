@@ -5,14 +5,14 @@ using Unity.Netcode.Components;
 // =========================================================
 // CUBO DE COLOR
 //
-// El primer jugador que lo toque (y tenga espacio en su inventario)
-// lo recoge: el cubo desaparece y su color pasa al inventario.
-// El servidor decide quién lo recoge.
+// - Lo recoge el primer jugador que lo toque (si tiene espacio):
+//   desaparece y su color pasa al inventario.
+// - Su color se replica (colorIndex) para que, al sacarlo del
+//   inventario, el cubo salga con el MISMO color.
 // =========================================================
 
 public class ColorCube : NetworkBehaviour
 {
-    // Colores posibles. El inventario guarda solo el índice.
     public static readonly Color[] Colors = { Color.red, Color.pink, Color.blue, Color.skyBlue };
 
     public Vector3 HandSlot = new Vector3(0.6f, 0f, 0.65f);
@@ -20,18 +20,55 @@ public class ColorCube : NetworkBehaviour
     // Distancia a la que el jugador recoge el cubo.
     public float pickupRadius = 0.8f;
 
+    // Índice de color replicado. -1 = todavía sin asignar.
+    public NetworkVariable<int> colorIndex = new NetworkVariable<int>(-1);
+
+    // Lo rellena el servidor ANTES de Spawn() para forzar un color.
+    [HideInInspector] public int pendingColorIndex = -1;
+
     private float nextPickupTime;
 
-    public int ColorIndex => (int)(NetworkObjectId % (ulong)Colors.Length);
+    public int ColorIndex => colorIndex.Value >= 0
+        ? colorIndex.Value
+        : (int)(NetworkObjectId % (ulong)Colors.Length);
 
     public bool IsHeld => transform.parent != null;
 
+
     public override void OnNetworkSpawn()
     {
-        GetComponent<Renderer>().material.color = Colors[ColorIndex];
+        if (IsServer && colorIndex.Value < 0)
+        {
+            colorIndex.Value = pendingColorIndex >= 0
+                ? pendingColorIndex
+                : (int)(NetworkObjectId % (ulong)Colors.Length);
+        }
 
-        // Un poco de margen para que no se recoja antes de caer del cofre.
+        colorIndex.OnValueChanged += OnColorChanged;
+        ApplyColor();
+
+        // Margen para que no se recoja antes de caer.
         nextPickupTime = Time.time + 0.5f;
+    }
+
+    public override void OnNetworkDespawn()
+    {
+        colorIndex.OnValueChanged -= OnColorChanged;
+    }
+
+    private void OnColorChanged(int previous, int current)
+    {
+        ApplyColor();
+    }
+
+    private void ApplyColor()
+    {
+        Renderer r = GetComponent<Renderer>();
+
+        if (r != null)
+        {
+            r.material.color = Colors[ColorIndex % Colors.Length];
+        }
     }
 
     private void Update()
@@ -47,16 +84,14 @@ public class ColorCube : NetworkBehaviour
 
             if (player == null || !player.IsSpawned) continue;
 
-            // Si el inventario está lleno, el cubo se queda en el suelo.
+            // Inventario lleno: el cubo se queda en el suelo.
             if (!player.TryAddToInventory(ColorIndex)) continue;
 
-            // Recogido: el cubo desaparece para todos.
             NetworkObject.Despawn();
             return;
         }
     }
 
-    // Se conservan por si luego quieres agarrar en la mano.
     public void Grab(NetworkObject user)
     {
         GetComponent<NetworkRigidbody>().SetIsKinematic(true);
@@ -72,6 +107,7 @@ public class ColorCube : NetworkBehaviour
         GetComponent<NetworkRigidbody>().SetIsKinematic(false);
         GetComponent<NetworkRigidbody>().SetLinearVelocity(throwSpeed);
 
+        // Evita que se recoja otra vez de inmediato.
         nextPickupTime = Time.time + 1.5f;
     }
 }
